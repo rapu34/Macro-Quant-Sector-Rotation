@@ -1,0 +1,10 @@
+.env
+data/
+outputs/
+*.pkl
+*.joblib
+.venv/
+.DS_Store
+*.docx
+__pycache__/
+*.pyc
