@@ -1,6 +1,6 @@
 # Macro-Quant Sector Rotation
 
-Combine macroeconomic indicators with US sector ETF prices to analyze and predict promising sectors. Pipeline is modular for extension and portfolio use.
+Combine macroeconomic indicators with US sector ETF prices to analyze and predict promising sectors. Pipeline is modular for extension.
 
 ---
 
@@ -50,18 +50,18 @@ Set `FRED_API_KEY` in a `.env` file at the project root (see `.env.example` if p
 
 ## Self-Verification (Phase 5-3)
 
-개발 완료 후 다음 명령으로 로직 검증을 수행하라:
+After development, run the following command to verify the logic:
 
 ```bash
 python tests/verify_advanced_logic.py
 ```
 
-- **HMM Labeling Check**: Crisis 상태가 최저 Sharpe(또는 최저 수익/최고 변동성)를 가지는지 Assert
-- **BIC Logic Check**: BIC 수식 `-2*ln(L) + k*ln(n)` 검증
-- **Turnover Control Check**: <5% Skip, >25% 50% Cap 동작 Print로 증명
-- **Block Bootstrap Check**: CVaR 신뢰구간 `(point, lo, hi)` 반환 확인
+- **HMM Labeling Check**: Assert that the Crisis state has the lowest Sharpe (or lowest return, highest volatility)
+- **BIC Logic Check**: Verify the BIC formula `-2*ln(L) + k*ln(n)`
+- **Turnover Control Check**: Print proof that <5% Skip and >25% 50% Cap work correctly
+- **Block Bootstrap Check**: Verify that CVaR returns the confidence interval `(point, lo, hi)`
 
-모든 체크가 **PASS**되면 Phase 5-3 로직이 정상 작동한 것이다.
+If all checks **PASS**, the Phase 5-3 logic is working correctly.
 
 ---
 
