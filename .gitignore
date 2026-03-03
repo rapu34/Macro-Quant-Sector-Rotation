@@ -1,10 +1,12 @@
 .env
 data/
 outputs/
+dev_logs/
 *.pkl
 *.joblib
 .venv/
 .DS_Store
 *.docx
+~$*
 __pycache__/
 *.pyc

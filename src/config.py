@@ -12,6 +12,7 @@ FRED_SERIES = {
     "DGS2": "treasury_2y",
     "CPIAUCSL": "cpi_all_urban",
     "UNRATE": "unemployment_rate",
+    "BAA10Y": "credit_spread",  # Moody's BAA - 10Y Treasury (credit spread)
 }
 
 # US sector ETFs (SPDR). Order is consistent for relative return / ranking.
@@ -26,6 +27,12 @@ SECTOR_ETFS = [
     "XLB",   # Materials
     "XLU",   # Utilities
 ]
+
+# 11 sectors for HMM sector dispersion (adds XLC, XLRE)
+SECTOR_ETFS_11 = SECTOR_ETFS + ["XLC", "XLRE"]  # Communication, Real Estate
+
+# Reproducibility: single seed for deterministic runs
+RANDOM_SEED = 42
 
 # Optional: default date range for pipeline runs (None = full history)
 DEFAULT_START = None  # e.g. "2010-01-01"
@@ -55,6 +62,10 @@ CVAR_ALPHA = 0.95             # 95% CVaR (Conditional Value at Risk) confidence 
 # Phase 5-3: Regime-Adaptive Risk Management
 KELLY_FRACTION = 0.25         # Fractional Kelly for exposure cap
 GROSS_EXPOSURE_CAP = 3.0     # Max leverage (300%) — survival guard
+# Phase 5-6: Weekly Guard — monitoring only (p_crisis_weekly_log.csv), NOT used for trading
+WEEKLY_GUARD_DAYS = 5         # Sub-period size for monitoring log
+P_CRISIS_GUARD_THRESHOLD = 0.8   # For log scale computation (monitoring)
+P_CRISIS_GUARD_SCALE = 0.8   # For log scale computation (monitoring)
 KELLY_ROLLING_DAYS = 60       # Rolling window for mu, sigma
 TURNOVER_CAP_THRESHOLD = 0.25 # If turnover > 25%, cap adjustment at 50%
 TURNOVER_CAP_RATE = 0.5       # Move 50% toward target when capped

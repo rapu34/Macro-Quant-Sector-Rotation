@@ -1,40 +1,73 @@
 # Macro-Quant Sector Rotation
 
-Combine macroeconomic indicators with US sector ETF prices to analyze and predict promising sectors. Pipeline is modular for extension.
+Combine macroeconomic indicators with US sector ETF prices to run an ensemble of **Block1 (XGBoost sector rotation)** and **Block2 (12M-1M momentum)** with HMM-based crisis regime detection.
+
+**Main document:** [PROJECT_REPORT.md](PROJECT_REPORT.md) — full pipeline, performance, governance, deliverables.
+
+**File structure:** [FILE_STRUCTURE.md](FILE_STRUCTURE.md) — detailed tree view.
 
 ---
 
-## Project phases (outline)
+## Repo structure
 
-| Phase | Module | Description |
-|-------|--------|-------------|
-| **1** | `src/data_loader.py` | **Data ingestion** – Fetch macro data (FRED) and sector ETF prices (yfinance). |
-| **2** | `src/feature_engineer.py` | **Feature engineering** – Moving averages, RSI, return volatility, macro lags. |
-| **3** | `src/strategy_analyzer.py` | **Strategic EDA & feature selection** – IC, sector beta, drift test. Outputs: `outputs/strategy_report.md`, `outputs/selected_features.json`. |
-| **4** | `src/model_trainer.py` | **Machine learning** – XGBoost or Random Forest for sector relative return prediction. |
-| **5** | `app.py` | **Visualization** – Streamlit dashboard for strategy performance and predictions. |
+```
+.
+├── PROJECT_REPORT.md       # Main portfolio report (performance, architecture, governance)
+├── FILE_STRUCTURE.md       # Detailed file tree
+├── README.md
+├── requirements.txt
+├── .env                     # FRED_API_KEY (git-ignored)
+├── .gitignore
+│
+├── src/                     # Core modules
+│   ├── data_loader.py       # Phase 1: FRED + yfinance
+│   ├── feature_engineer.py   # Phase 2: Feature engineering
+│   ├── strategy_analyzer.py # Phase 3: IC, feature selection, HMM
+│   └── model_trainer.py     # Phase 4: XGBoost walk-forward
+│
+├── data/                    # Raw and processed data (git-ignored)
+│   ├── raw_data_extended_2005.csv
+│   └── processed_features_extended_2005.csv
+│
+├── outputs/                 # Production outputs (git-ignored)
+│   ├── model.pkl
+│   ├── backtest_report.md
+│   ├── hmm_regime.csv
+│   ├── selected_features.json
+│   ├── final_risk_governance_report.csv
+│   └── audit/
+│
+├── experiments/
+│   ├── scripts/             # Pipeline and experiment scripts
+│   │   ├── true_daily_returns.py
+│   │   ├── block2_hmm_expanding_variants.py
+│   │   ├── factor_regression.py
+│   │   ├── factor_regression_validation.py
+│   │   └── stress_test.py
+│   └── outputs/             # Main deliverables
+│       ├── true_daily_block1.csv
+│       ├── block2_hmm_expanding_rebalonly.csv
+│       ├── stress_test_report.md
+│       ├── factor_regression_validation_report.md
+│       └── archive/          # Intermediate experiment outputs
+│
+├── dev_logs/                # Internal logs (git-ignored)
+│   ├── dev_log.md
+│   └── experimental_details.md
+│
+└── tests/
+    └── verify_advanced_logic.py
+```
 
 ---
 
-## Pipeline contract (modular I/O)
+## Main pipeline (execution order)
 
-Each phase consumes output from the previous step. Keeping this contract stable makes it easy to extend or swap implementations.
-
-- **Phase 1 output**
-  - `macro_df`: `DatetimeIndex`, columns = macro indicator names (e.g. `fed_funds_rate`, `cpi_all_urban`).
-  - `sector_df`: `DatetimeIndex`, columns = sector ETF tickers (e.g. `XLK`, `XLF`), values = adjusted close.
-
-- **Phase 2 input:** `data/raw_data.csv` (or `macro_df`, `sector_df`).  
-  **Output:** `data/processed_features.csv` — feature matrix (macro lag20, volatility_20d, relative_ret_20d, RSI, ma_ratio) and target (1 if sector in top 3 by 20d forward return, else 0).
-
-- **Phase 3 input:** `data/processed_features.csv`.  
-  **Output:** `outputs/strategy_report.md` (IC, sector beta, drift), `outputs/selected_features.json` (validated feature list).
-
-- **Phase 4 input:** `data/processed_features.csv` + `outputs/selected_features.json`.  
-  **Output:** `outputs/model.pkl`, `outputs/backtest_report.md`, `outputs/backtest_chart.png` (walk-forward, costs, Sharpe, MDD).
-
-- **Phase 5 input:** Predictions, backtest results, model metadata.  
-  **Output:** Streamlit app (charts and tables).
+1. `true_daily_returns.py` → block1, block2 CSV
+2. `block2_hmm_expanding_variants.py` → block2_hmm_rebalonly.csv
+3. `factor_regression.py` → factor exposure (SPY/VIX required)
+4. `factor_regression_validation.py` → risk audit
+5. `stress_test.py` → stress_test_report.md
 
 ---
 
@@ -44,49 +77,14 @@ Each phase consumes output from the previous step. Keeping this contract stable 
 pip install -r requirements.txt
 ```
 
-Set `FRED_API_KEY` in a `.env` file at the project root (see `.env.example` if present).
+Set `FRED_API_KEY` in a `.env` file at the project root.
 
 ---
 
-## Self-Verification (Phase 5-3)
-
-After development, run the following command to verify the logic:
+## Self-Verification
 
 ```bash
 python tests/verify_advanced_logic.py
 ```
 
-- **HMM Labeling Check**: Assert that the Crisis state has the lowest Sharpe (or lowest return, highest volatility)
-- **BIC Logic Check**: Verify the BIC formula `-2*ln(L) + k*ln(n)`
-- **Turnover Control Check**: Print proof that <5% Skip and >25% 50% Cap work correctly
-- **Block Bootstrap Check**: Verify that CVaR returns the confidence interval `(point, lo, hi)`
-
-If all checks **PASS**, the Phase 5-3 logic is working correctly.
-
----
-
-## Repo structure (current)
-
-```
-.
-├── .env                 # FRED_API_KEY (git-ignored)
-├── .gitignore
-├── README.md
-├── requirements.txt
-├── tests/
-│   └── verify_advanced_logic.py  # Phase 5-3 self-verification
-├── app.py               # Phase 5: Streamlit dashboard (stub)
-├── data/
-│   ├── raw_data.csv
-│   └── processed_features.csv
-├── outputs/
-│   ├── strategy_report.md
-│   └── selected_features.json
-└── src/
-    ├── __init__.py
-    ├── config.py
-    ├── data_loader.py       # Phase 1
-    ├── feature_engineer.py  # Phase 2
-    ├── strategy_analyzer.py # Phase 3
-    └── model_trainer.py     # Phase 4 (stub)
-```
+- HMM Labeling Check, BIC Logic Check, Turnover Control Check, Block Bootstrap Check

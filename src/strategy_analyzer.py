@@ -9,14 +9,23 @@ Runs three core quant analyses:
 """
 
 import json
+import os
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+
+# HMM robustness: min observations for training; relaxed tol for short sub-periods
+HMM_MIN_OBS = 30
+HMM_TOL = 1e-3
+HMM_N_ITER = 200
 from scipy import stats
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
+
+from src.config import RANDOM_SEED
 
 # ---------------------------------------------------------------------------
 # Config
@@ -328,7 +337,7 @@ def run(
         processed_raw = pd.read_csv(processed_path, parse_dates=["date"])
         start = processed_raw["date"].min().strftime("%Y-%m-%d")
         end = processed_raw["date"].max().strftime("%Y-%m-%d")
-        _, regime_df = get_hmm_regime_model(start=start, end=end)
+        _, regime_df, _ = get_hmm_regime_model(start=start, end=end)
         if not regime_df.empty:
             regime_df.to_csv(root / "outputs" / "hmm_regime.csv", index=False)
     except Exception:
@@ -363,147 +372,324 @@ def run(
 
 
 # ---------------------------------------------------------------------------
-# 5. Hidden Regime Detection (HMM) — Robust Engine
+# 5. Hidden Regime Detection (HMM) — 2-State Core-Crisis (Production)
 # ---------------------------------------------------------------------------
-def _compute_bic(model, X: np.ndarray) -> float:
-    """BIC = -2*ln(L) + k*ln(n). Lower is better."""
-    n = X.shape[0]
-    logL = model.score(X)
-    n_states = model.n_components
-    n_features = X.shape[1]
-    k = n_states**2 + (n_states - 1) + n_states * n_features * 2  # trans + start + means + diag cov
-    return -2 * logL + k * np.log(n)
+HMM_N_STATES = 2
+HMM_N_INIT = 30
+HMM_OCCUPANCY_DEAD = 0.05
+HMM_OCCUPANCY_GRADE_A = 0.10
+HYSTERESIS_ENTER = 0.8
+HYSTERESIS_EXIT = 0.6
+
+FEATURE_NAMES_4D = ["credit_stress", "vol_term", "sector_disp", "market_mom"]
 
 
-def _fit_hmm_bic(X: np.ndarray) -> tuple[object, np.ndarray, dict]:
+def _load_hmm_features_4d(start: Optional[str] = None, end: Optional[str] = None) -> tuple[pd.DataFrame, Optional[object]]:
     """
-    Fit HMM with BIC-based n_components selection (2~4).
-    covariance_type='diag'. Returns (model, P_Crisis array, state_mapping).
+    Load 4D features for HMM:
+    a) Credit Stress: HYG ret - IEF ret (return difference)
+    b) Vol Term Structure: VIX / VXV ratio
+    c) Sector Dispersion: cross-sectional std of 11 sector returns
+    d) Market Momentum: SPY price vs 20d MA distance (log ratio)
+    Returns (DataFrame with date + 4 cols, scaler fit on data).
     """
     try:
-        from hmmlearn.hmm import GaussianHMM
+        import yfinance as yf
+        from src.config import SECTOR_ETFS_11
     except ImportError:
-        return None, np.array([]), {}
+        return pd.DataFrame(), None, pd.DataFrame()
 
-    best_bic, best_model, best_probs = np.inf, None, None
-    for n_comp in [2, 3, 4]:
-        if X.shape[0] < n_comp * 5:
-            continue
+    def _get_close(ticker: str) -> pd.Series:
+        d = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+        if d.empty:
+            return pd.Series(dtype=float)
+        c = d["Close"] if "Close" in d.columns else d.iloc[:, 0]
+        return c.squeeze()
+
+    closes = {}
+    for t in ["HYG", "IEF", "SPY", "^VIX", "^VIX3M", "^VXV"] + list(SECTOR_ETFS_11):
+        s = _get_close(t)
+        if not s.empty:
+            closes[t] = s
+
+    if len(closes) < 7:
+        return pd.DataFrame(), None, pd.DataFrame()
+
+    common_idx = None
+    for v in closes.values():
+        idx = v.dropna().index
+        common_idx = idx if common_idx is None else common_idx.intersection(idx)
+
+    if common_idx is None or len(common_idx) < HMM_MIN_OBS:
+        return pd.DataFrame(), None, pd.DataFrame()
+
+    # a) Credit Stress: HYG ret - IEF ret
+    hyg = closes.get("HYG", pd.Series(dtype=float)).reindex(common_idx).ffill().bfill()
+    ief = closes.get("IEF", pd.Series(dtype=float)).reindex(common_idx).ffill().bfill()
+    hyg_ret = np.log(hyg / hyg.shift(1))
+    ief_ret = np.log(ief / ief.shift(1))
+    credit_stress = (hyg_ret - ief_ret).dropna()
+
+    # b) Vol Term: VIX / VIX3M (VXV may be delisted; ^VIX3M = 3-month VIX)
+    vix = closes.get("^VIX", pd.Series(dtype=float)).reindex(common_idx).ffill().bfill().replace(0, np.nan)
+    vix3m = closes.get("^VIX3M", closes.get("^VXV", pd.Series(dtype=float))).reindex(common_idx).ffill().bfill().replace(0, np.nan)
+    vol_term = (vix / vix3m).replace(np.inf, np.nan)
+
+    # c) Sector Dispersion: cross-sectional std of sector returns
+    sector_tickers = [c for c in SECTOR_ETFS_11 if c in closes]
+    sector_rets = pd.DataFrame({
+        c: np.log(closes[c].reindex(common_idx).ffill().bfill() / closes[c].reindex(common_idx).ffill().bfill().shift(1))
+        for c in sector_tickers
+    })
+    sector_disp = sector_rets.std(axis=1)
+
+    # d) Market Momentum: SPY price / 20d MA (log)
+    spy = closes.get("SPY", pd.Series(dtype=float)).reindex(common_idx).ffill().bfill()
+    ma20 = spy.rolling(20).mean()
+    market_mom = np.log(spy / ma20)
+
+    df = pd.DataFrame({
+        "credit_stress": credit_stress,
+        "vol_term": vol_term,
+        "sector_disp": sector_disp,
+        "market_mom": market_mom,
+    }, index=common_idx).dropna(how="any")
+
+    if len(df) < HMM_MIN_OBS:
+        return pd.DataFrame(), None, pd.DataFrame()
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(df[FEATURE_NAMES_4D])
+    df_scaled = pd.DataFrame(X_scaled, index=df.index, columns=FEATURE_NAMES_4D)
+    return df_scaled, scaler, df
+
+
+def _fit_hmm_2state(
+    X: np.ndarray,
+    scaler: Optional[object] = None,
+    n_init: int = HMM_N_INIT,
+) -> tuple[Optional[object], np.ndarray, np.ndarray, dict, dict]:
+    """
+    2-state Core-Crisis HMM: Normal vs Crisis.
+    KMeans warm start, init_params="", params="stmc", transmat diag=0.8.
+    Crisis = state with higher (credit_stress + vol_term).
+    Returns (model, p_crisis, probs, bic_info, feature_means).
+    """
+    n_states = 2
+    empty_result = (None, np.array([]), np.array([]), {"selected_n": 2, "log_likelihood": None, "occupancy": {}}, {})
+    try:
+        from hmmlearn.hmm import GaussianHMM
+        from sklearn.cluster import KMeans
+    except ImportError:
+        return empty_result
+
+    n, n_feat = X.shape
+    if n < HMM_MIN_OBS or n_feat != 4:
+        return empty_result
+
+    best_model, best_score = None, -np.inf
+
+    for trial in range(n_init):
         try:
-            m = GaussianHMM(n_components=n_comp, covariance_type="diag", n_iter=100, random_state=42)
-            m.fit(X)
-            bic = _compute_bic(m, X)
-            if bic < best_bic:
-                best_bic = bic
+            kmeans = KMeans(n_clusters=n_states, random_state=RANDOM_SEED + trial, n_init=10).fit(X)
+            centers = kmeans.cluster_centers_
+            labels = kmeans.labels_
+
+            covars = np.zeros((n_states, n_feat))
+            for k in range(n_states):
+                mask = labels == k
+                if mask.sum() > 1:
+                    covars[k] = np.var(X[mask], axis=0) + 1e-6
+                else:
+                    covars[k] = np.var(X, axis=0) + 1e-6
+
+            trans = np.eye(n_states) * 0.8 + (1 - np.eye(n_states)) * 0.2 / (n_states - 1)
+
+            m = GaussianHMM(
+                n_components=n_states,
+                covariance_type="diag",
+                n_iter=HMM_N_ITER,
+                tol=HMM_TOL,
+                random_state=RANDOM_SEED + trial,
+                verbose=False,
+                init_params="",
+                params="stmc",
+            )
+            m.means_ = centers.copy()
+            m.covars_ = covars.copy()
+            m.startprob_ = np.full(n_states, 1.0 / n_states)
+            m.transmat_ = trans.copy()
+
+            with open(os.devnull, "w") as devnull:
+                with redirect_stdout(devnull), redirect_stderr(devnull):
+                    m.fit(X)
+
+            score = m.score(X)
+            if score > best_score:
+                best_score = score
                 best_model = m
-                probs = m.predict_proba(X)
-                states = m.predict(X)
-                scores = []
-                for k in range(n_comp):
-                    mask = states == k
-                    if not mask.any():
-                        scores.append(1e9)
-                        continue
-                    mr = X[mask, 0].mean()
-                    vr = X[mask, 0].std() if mask.sum() > 1 else 0.01
-                    scores.append(mr - 1.0 * vr)
-                crisis_idx = int(np.argmin(scores))
-                best_probs = probs[:, crisis_idx]
+
         except Exception:
             continue
-    return best_model, best_probs if best_probs is not None else np.array([]), {}
+
+    if best_model is None:
+        return empty_result
+
+    model = best_model
+    X_used = X
+    probs = model.predict_proba(X_used)
+    states = model.predict(X_used)
+    unique, counts = np.unique(states, return_counts=True)
+    total = counts.sum()
+    occupancy = {int(u): float(c / total) for u, c in zip(unique, counts)}
+
+    # Crisis = state with higher (credit_stress + vol_term)
+    feature_means = {}
+    stress_scores = []
+    for k in range(n_states):
+        mask = states == k
+        if mask.any():
+            fm = {FEATURE_NAMES_4D[j]: float(X_used[mask, j].mean()) for j in range(4)}
+            feature_means[k] = fm
+            stress_scores.append(fm.get("credit_stress", 0) + fm.get("vol_term", 0))
+        else:
+            feature_means[k] = {f: 0.0 for f in FEATURE_NAMES_4D}
+            stress_scores.append(-1e9)
+
+    crisis_idx = int(np.argmax(stress_scores))
+    p_crisis = probs[:, crisis_idx]
+
+    bic_info = {
+        "selected_n": n_states,
+        "log_likelihood": float(best_score),
+        "occupancy": occupancy,
+    }
+    return model, p_crisis, probs, bic_info, feature_means
+
+
+def _apply_hysteresis(p_raw: np.ndarray, enter: float = HYSTERESIS_ENTER, exit_: float = HYSTERESIS_EXIT) -> np.ndarray:
+    """Apply hysteresis: enter crisis when p > enter, exit when p < exit."""
+    out = np.zeros_like(p_raw, dtype=float)
+    in_crisis = False
+    for i in range(len(p_raw)):
+        if in_crisis:
+            if p_raw[i] < exit_:
+                in_crisis = False
+                out[i] = float(p_raw[i])
+            else:
+                out[i] = enter
+        else:
+            if p_raw[i] > enter:
+                in_crisis = True
+                out[i] = enter
+            else:
+                out[i] = float(p_raw[i])
+    return out
 
 
 def get_hmm_regime_model(
     start: Optional[str] = None,
     end: Optional[str] = None,
-) -> tuple[Optional[object], pd.DataFrame]:
+    hysteresis_enter: float = HYSTERESIS_ENTER,
+    hysteresis_exit: float = HYSTERESIS_EXIT,
+    crisis_selector: str = "default",
+) -> tuple[Optional[object], pd.DataFrame, dict]:
     """
-    Fit HMM (BIC selection, diag cov, state labeling).
-    Returns (model, DataFrame with date, state, P_Crisis).
+    Professional 4-state HMM with 4D features, K-Means warm start, 3-stage selection.
+    Returns (model, DataFrame with date, state, P_Crisis, forward_ret_20d, bic_info).
+    bic_info: {selected_n, log_likelihood, occupancy, feature_means_per_state}
     """
+    empty_bic = {"selected_n": 4, "log_likelihood": None, "occupancy": {}, "feature_means_per_state": {}}
+    out = _load_hmm_features_4d(start=start, end=end)
+    if len(out) < 2:
+        return None, pd.DataFrame(), empty_bic
+    df_feat, scaler = out[0], out[1]
+    if df_feat.empty or scaler is None:
+        return None, pd.DataFrame(), empty_bic
+
+    X = df_feat[FEATURE_NAMES_4D].values
+    dates_valid = df_feat.index
+
+    model, p_crisis, probs, bic_info, feature_means = _fit_hmm_2state(X, scaler=scaler, n_init=HMM_N_INIT)
+    if model is None or len(p_crisis) == 0:
+        bic_info["feature_means_per_state"] = feature_means
+        return None, pd.DataFrame(), bic_info
+
+    states = model.predict(X)
+
+    # Forward 20-day SPY return
     try:
         import yfinance as yf
-    except ImportError:
-        return None, pd.DataFrame()
+        spy = yf.download("SPY", start=start, end=end, progress=False, auto_adjust=True)
+        if not spy.empty:
+            spy_close = spy["Close"] if "Close" in spy.columns else spy.iloc[:, 0]
+            if isinstance(spy_close, pd.DataFrame):
+                spy_close = spy_close.squeeze()
+            spy_aligned = spy_close.reindex(dates_valid).ffill().bfill()
+            fwd_20d = np.log(spy_aligned.shift(-20) / spy_aligned)
+            fwd_vals = fwd_20d.values
+        else:
+            fwd_vals = np.full(len(dates_valid), np.nan)
+    except Exception:
+        fwd_vals = np.full(len(dates_valid), np.nan)
 
-    spy = yf.download("SPY", start=start, end=end, progress=False, auto_adjust=True)
-    vix = yf.download("^VIX", start=start, end=end, progress=False, auto_adjust=True)
-    if spy.empty or vix.empty:
-        return None, pd.DataFrame()
+    p_crisis_hyst = _apply_hysteresis(p_crisis, hysteresis_enter, hysteresis_exit)
 
-    spy_close = spy["Close"] if "Close" in spy.columns else spy.iloc[:, 0]
-    vix_close = vix["Close"] if "Close" in vix.columns else vix.iloc[:, 0]
-    if isinstance(spy_close, pd.DataFrame):
-        spy_close = spy_close.squeeze()
-    if isinstance(vix_close, pd.DataFrame):
-        vix_close = vix_close.squeeze()
-
-    spy_ret = np.log(spy_close / spy_close.shift(1)).dropna()
-    vix_chg = (vix_close - vix_close.shift(1)) / vix_close.shift(1)
-    common = spy_ret.index.intersection(vix_chg.index)
-    spy_a = spy_ret.reindex(common).ffill().bfill()
-    vix_a = vix_chg.reindex(common).ffill().bfill()
-    valid = ~(spy_a.isna() | vix_a.isna())
-    spy_a = spy_a.loc[valid].values.reshape(-1, 1)
-    vix_a = vix_a.loc[valid].values.reshape(-1, 1)
-    dates_valid = common[valid]
-    X = np.column_stack([spy_a.squeeze(), vix_a.squeeze()])
-
-    model, p_crisis, _ = _fit_hmm_bic(X)
-    if model is None or len(p_crisis) == 0:
-        return None, pd.DataFrame()
-    states = model.predict(X)
+    bic_info["feature_means_per_state"] = feature_means
 
     result = pd.DataFrame({
         "date": dates_valid,
         "state": states,
-        "P_Crisis": p_crisis,
+        "P_Crisis": p_crisis_hyst,
+        "forward_ret_20d": fwd_vals,
     })
-    return model, result
+    return model, result, bic_info
 
 
 def get_hmm_input_data(start: Optional[str] = None, end: Optional[str] = None) -> tuple[np.ndarray, pd.DatetimeIndex]:
-    """Return (X, dates) for HMM: SPY log return + VIX change rate. Used for expanding-window inference."""
-    try:
-        import yfinance as yf
-    except ImportError:
+    """Return (X_raw, dates) for HMM: 4D raw features. Used for expanding-window inference."""
+    out = _load_hmm_features_4d(start=start, end=end)
+    if len(out) < 3:
         return np.array([]), pd.DatetimeIndex([])
-    spy = yf.download("SPY", start=start, end=end, progress=False, auto_adjust=True)
-    vix = yf.download("^VIX", start=start, end=end, progress=False, auto_adjust=True)
-    if spy.empty or vix.empty:
+    df_scaled, scaler, df_raw = out[0], out[1], out[2]
+    if df_raw.empty:
         return np.array([]), pd.DatetimeIndex([])
-    spy_close = spy["Close"] if "Close" in spy.columns else spy.iloc[:, 0].squeeze()
-    vix_close = vix["Close"] if "Close" in vix.columns else vix.iloc[:, 0].squeeze()
-    spy_ret = np.log(spy_close / spy_close.shift(1)).dropna()
-    vix_chg = (vix_close - vix_close.shift(1)) / vix_close.shift(1)
-    common = spy_ret.index.intersection(vix_chg.index)
-    valid = ~(spy_ret.reindex(common).isna() | vix_chg.reindex(common).isna())
-    dates = common[valid]
-    X = np.column_stack([
-        spy_ret.reindex(dates).ffill().bfill().values,
-        vix_chg.reindex(dates).ffill().bfill().values,
-    ])
-    return X, pd.DatetimeIndex(dates)
+    X = df_raw[FEATURE_NAMES_4D].values
+    dates = pd.DatetimeIndex(df_raw.index)
+    if len(dates) < HMM_MIN_OBS:
+        return np.array([]), pd.DatetimeIndex([])
+    return X, dates
 
 
 def get_p_crisis_expanding(
     X: np.ndarray,
     dates: pd.DatetimeIndex,
     asof_date: pd.Timestamp,
+    hysteresis_enter: float = HYSTERESIS_ENTER,
+    hysteresis_exit: float = HYSTERESIS_EXIT,
 ) -> float:
     """
-    Expanding-window HMM: fit on data up to asof_date only.
-    Returns P_Crisis for the last observation (no look-ahead).
+    Expanding-window HMM: fit on data up to asof_date only (4D features, scaled).
+    Returns P_Crisis for the last observation (no look-ahead), with hysteresis.
+    On data shortage or convergence failure: return 0.5 (neutral).
     """
-    idx = dates.get_indexer([asof_date], method="ffill")[0]
-    if idx < 0:
-        return 0.0
-    X_sub = X[: idx + 1]
-    if X_sub.shape[0] < 20:
-        return 0.0
-    _, p_crisis, _ = _fit_hmm_bic(X_sub)
-    return float(p_crisis[-1]) if len(p_crisis) > 0 else 0.0
+    try:
+        idx = dates.get_indexer([asof_date], method="ffill")[0]
+        if idx < 0:
+            return 0.5
+        X_sub = X[: idx + 1]
+        if X_sub.shape[0] < HMM_MIN_OBS or X_sub.shape[1] != 4:
+            return 0.5
+        # No look-ahead scaling: scaler fit ONLY on X_sub (data up to asof_date)
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_sub)
+        _, p_crisis, _, _, _ = _fit_hmm_2state(X_scaled, scaler=scaler, n_init=min(10, HMM_N_INIT))
+        if len(p_crisis) == 0:
+            return 0.5
+        p_hyst = _apply_hysteresis(p_crisis, HYSTERESIS_ENTER, HYSTERESIS_EXIT)
+        return float(p_hyst[-1])
+    except Exception:
+        return 0.5
 
 
 def get_p_crisis_asof(date: pd.Timestamp, regime_df: pd.DataFrame) -> float:

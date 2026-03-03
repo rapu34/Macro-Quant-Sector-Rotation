@@ -172,6 +172,16 @@ def _build_macro_features(macro_df: pd.DataFrame) -> pd.DataFrame:
             s = macro_df[col].ffill()
             out[f"{col}_shock_20d"] = s - s.shift(20)
 
+    # Real rate: treasury_10y - CPI YoY (both in %). Growth vs Value rotation.
+    if "treasury_10y" in macro_df.columns and "cpi_all_urban" in macro_df.columns:
+        tc10 = macro_df["treasury_10y"].ffill()
+        cpi = macro_df["cpi_all_urban"].ffill()
+        cpi_yoy_pct = cpi.pct_change(252) * 100  # annual inflation in %
+        real_rate = tc10 - cpi_yoy_pct
+        roll_mean = real_rate.rolling(w, min_periods=w // 2).mean()
+        roll_std = real_rate.rolling(w, min_periods=w // 2).std().replace(0, np.nan)
+        out["real_rate_zscore"] = (real_rate - roll_mean) / roll_std
+
     return pd.DataFrame(out, index=macro_df.index)
 
 

@@ -7,10 +7,14 @@ Outputs: model.pkl, backtest_report.md.
 
 import json
 import pickle
+import warnings
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+# Suppress XGBoost use_label_encoder deprecation (removed in code)
+warnings.filterwarnings("ignore", message=".*use_label_encoder.*", category=UserWarning)
 import pandas as pd
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
@@ -19,6 +23,7 @@ from src.config import (
     BLOCK_BOOTSTRAP_ITER,
     BLOCK_SIZE_MAX,
     BLOCK_SIZE_MIN,
+    RANDOM_SEED,
     CROWDING_LOOKBACK,
     CROWDING_MULTIPLIER,
     CVAR_ALPHA,
@@ -26,6 +31,8 @@ from src.config import (
     GROSS_EXPOSURE_CAP,
     KELLY_FRACTION,
     KELLY_ROLLING_DAYS,
+    P_CRISIS_GUARD_SCALE,
+    P_CRISIS_GUARD_THRESHOLD,
     TURNOVER_CAP_RATE,
     TURNOVER_CAP_THRESHOLD,
     SECTOR_ETFS,
@@ -37,6 +44,7 @@ from src.config import (
     TURNOVER_THRESHOLD,
     VIX_Z_THRESHOLD_MAX,
     VIX_Z_THRESHOLD_MIN,
+    WEEKLY_GUARD_DAYS,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,7 +59,7 @@ LEARNING_RATE = 0.05
 SUBSAMPLE = 0.8
 COL_SAMPLE_BY_TREE = 0.8
 N_ESTIMATORS = 200
-RANDOM_STATE = 42
+RANDOM_STATE = RANDOM_SEED
 MIN_TRAIN_PCT = 0.4   # Minimum 40% of data for first training window
 REBALANCE_DAYS = 20   # Hold period; rebalance every 20 trading days
 
@@ -155,13 +163,19 @@ def _compute_vol_scaled_weights(
     exposure_diag: Optional[dict] = None,
     cov_matrix: Optional[pd.DataFrame] = None,
     gross_exposure_cap: Optional[float] = None,
+    risk_mult_min: float = 0.5,
+    risk_mult_step: Optional[tuple] = None,
 ) -> dict[str, float]:
     """
     Portfolio-level vol scaling: scale_factor = target_vol / portfolio_estimated_vol.
     portfolio_vol = sqrt(w^T Σ w). Base weights = inverse vol, normalized.
     """
     tv = target_vol or TARGET_VOL
-    risk_mult = max(0.01, 1.0 - p_crisis)
+    if risk_mult_step is not None:
+        thresh, mult_val = risk_mult_step
+        risk_mult = mult_val if p_crisis > thresh else 1.0
+    else:
+        risk_mult = max(risk_mult_min, 1.0 - p_crisis)
     cap = gross_exposure_cap if gross_exposure_cap is not None else GROSS_EXPOSURE_CAP
     cap = min(kelly_cap, cap)
 
@@ -227,6 +241,37 @@ def _apply_turnover_cap(
     }
 
 
+def _get_subperiod_return(
+    raw: pd.DataFrame,
+    start_date,
+    end_date,
+    holdings: set,
+    weights: dict[str, float],
+) -> float:
+    """5-day (or shorter) log return for portfolio from start_date to end_date."""
+    scols = [c for c in raw.columns if c in SECTOR_ETFS]
+    if not scols or not holdings:
+        return 0.0
+    raw_idx = raw.index
+    try:
+        start_idx = raw_idx.get_indexer([pd.Timestamp(start_date)], method="ffill")[0]
+        end_idx = raw_idx.get_indexer([pd.Timestamp(end_date)], method="ffill")[0]
+    except Exception:
+        return 0.0
+    if start_idx < 0 or end_idx < 0 or end_idx >= len(raw) or start_idx >= len(raw):
+        return 0.0
+    prices_start = raw.iloc[start_idx]
+    prices_end = raw.iloc[end_idx]
+    ret = 0.0
+    for s in holdings:
+        if s in scols and s in weights and weights[s] > 1e-8:
+            p0 = float(prices_start.get(s, np.nan))
+            p1 = float(prices_end.get(s, np.nan))
+            if p0 and p1 and p0 > 1e-12:
+                ret += weights[s] * (np.log(p1 / p0))
+    return ret
+
+
 def _compute_kelly_cap(returns: np.ndarray) -> float:
     """0.25 Kelly = 0.25 * (mu / sigma^2), clipped. Use as Gross_Exposure cap."""
     if len(returns) < 10:
@@ -253,15 +298,26 @@ def _walk_forward_backtest(
     fear_threshold: Optional[float] = None,
     target_vol: Optional[float] = None,
     p_crisis_log: Optional[list] = None,
+    weekly_guard_log: Optional[list] = None,
     kelly_cap_min: Optional[float] = None,
     gross_exposure_log: Optional[list] = None,
     exposure_diag: Optional[dict] = None,
     gross_exposure_cap_override: Optional[float] = None,
     raw_for_cov: Optional[pd.DataFrame] = None,
+    use_weekly_guard: bool = True,
+    show_progress: bool = False,
+    risk_mult_min: float = 0.5,
+    risk_mult_step: Optional[tuple] = None,
+    audit_capture: Optional[dict] = None,
+    audit_capture_date: Optional[str] = None,
+    weights_log: Optional[list] = None,
 ) -> tuple[list, list, list]:
     """
     Walk-forward: train on expanding window, predict at each rebalance, compute period returns.
-    With risk_mgmt: panic exit when sentiment < EXTREME_FEAR_THRESHOLD; crowding filter skeleton.
+    Monthly (REBALANCE_DAYS) only. Weekly Guard removed from trading — monitoring log only.
+
+    Transaction cost: ONLY when sectors change (holdings != prev_holdings), not on turnover skip.
+
     Returns: (gross_returns, net_returns, rebalance_dates)
     """
     df = df.sort_values("date").reset_index(drop=True)
@@ -276,17 +332,33 @@ def _walk_forward_backtest(
         except Exception:
             raw_for_cov = None
 
+    raw_for_guard = raw_for_cov  # for monitoring log only
+
     gross_rets = []
     net_rets = []
     rebal_dates = []
+    turnover_list = []
     prev_holdings = None
     prev_weights = None
     in_cash = False
 
-    for test_start_idx in range(min_train_idx, n_dates, step):
+    iter_range = list(range(min_train_idx, n_dates, step))
+    pbar = None
+    if show_progress:
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(iter_range, desc="Backtest", unit="period")
+        except ImportError:
+            pbar = iter_range
+    else:
+        pbar = iter_range
+
+    for test_start_idx in pbar:
         test_end_idx = min(test_start_idx + 1, n_dates)
         train_end_idx = test_start_idx
         test_date = dates[test_start_idx]
+        if show_progress and pbar is not None and hasattr(pbar, "set_postfix"):
+            pbar.set_postfix(date=str(test_date)[:10])
         test_date_ts = pd.Timestamp(test_date) if not isinstance(test_date, pd.Timestamp) else test_date
 
         # Panic trigger: sentiment < 25 -> hold cash
@@ -304,6 +376,9 @@ def _walk_forward_backtest(
                 gross_rets.append(period_ret)
                 net_rets.append(period_ret - cost)
                 rebal_dates.append(test_date)
+                turnover_list.append(1.0 if prev_holdings else 0.0)
+                if weights_log is not None:
+                    weights_log.append((test_date, {s: 0.0 for s in SECTOR_ETFS}, cost, True))
                 prev_holdings = set()
                 in_cash = True
                 continue
@@ -335,7 +410,6 @@ def _walk_forward_backtest(
             n_estimators=N_ESTIMATORS,
             scale_pos_weight=scale_pos,
             random_state=RANDOM_STATE,
-            use_label_encoder=False,
             eval_metric="logloss",
         )
         model.fit(X_train_s, y_train)
@@ -371,7 +445,7 @@ def _walk_forward_backtest(
             from src.strategy_analyzer import get_p_crisis_asof
             p_crisis = get_p_crisis_asof(test_date_ts, regime_df)
 
-        risk_mult = max(0.01, 1.0 - p_crisis)
+        risk_mult = max(risk_mult_min, 1.0 - p_crisis)
         if p_crisis_log is not None:
             p_crisis_log.append({"date": test_date, "p_crisis": p_crisis, "risk_mult": risk_mult})
 
@@ -397,6 +471,8 @@ def _walk_forward_backtest(
                 test_df, holdings, p_crisis, target_vol=tv, kelly_cap=kelly_cap,
                 exposure_diag=exposure_diag, cov_matrix=cov_matrix,
                 gross_exposure_cap=gross_exposure_cap_override,
+                risk_mult_min=risk_mult_min,
+                risk_mult_step=risk_mult_step,
             )
             weights = _apply_crowding_filter(weights, sector_5d_ret, hist_mean_5d)
         else:
@@ -405,43 +481,103 @@ def _walk_forward_backtest(
 
         target_weights_full = {s: weights.get(s, 0) for s in SECTOR_ETFS}
         prev_weights_full = prev_weights or {s: 0.0 for s in SECTOR_ETFS}
+        turnover_raw = _turnover(prev_weights_full, target_weights_full)
         weights = _apply_turnover_cap(prev_weights_full, target_weights_full)
         new_weights_full = {s: weights.get(s, 0) for s in SECTOR_ETFS}
         turnover = _turnover(prev_weights_full, new_weights_full)
         if gross_exposure_log is not None:
             gross_exposure_log.append(sum(abs(w) for w in weights.values()))
 
-        if use_institutional and prev_holdings is not None and turnover < TURNOVER_THRESHOLD:
+        # --- Transaction Cost 1: Sector replacement (섹터 교체 시에만) ---
+        # Occurs ONLY when we actually change sector holdings, NOT when we skip rebalance.
+        sector_rebalance_cost = 0.0
+        if turnover >= TURNOVER_THRESHOLD or prev_holdings is None:
+            if prev_holdings is None:
+                sector_rebalance_cost = TOP_K * COST_RATE * (1.0 / TOP_K)
+            elif holdings != prev_holdings:
+                n_changed = len(holdings.symmetric_difference(prev_holdings))
+                sector_rebalance_cost = n_changed * ROUND_TRIP_RATE * (1.0 / TOP_K)
+
+        # --- Period return: Monthly (REBALANCE_DAYS) only — Weekly Guard removed from trading ---
+        if turnover < TURNOVER_THRESHOLD and prev_holdings is not None:
             holdings = prev_holdings
             weights_held = prev_weights or {s: 1.0 / TOP_K for s in holdings}
-            period_ret = sum(
-                test_df[test_df["sector"] == s]["fwd_ret_20d"].values[0] * weights_held.get(s, 0)
-                for s in holdings if s in test_df["sector"].values
-            )
-            cost = 0.0
-            weights = prev_weights
         else:
-            active_holdings = {s for s in SECTOR_ETFS if weights.get(s, 0) > 1e-8}
-            if not active_holdings:
-                active_holdings = holdings
-            period_ret = sum(
-                test_df[test_df["sector"] == s]["fwd_ret_20d"].values[0] * weights.get(s, 0)
-                for s in active_holdings if s in test_df["sector"].values
-            )
-            weight_per_sector = 1.0 / TOP_K
-            if prev_holdings is None:
-                cost = TOP_K * COST_RATE * weight_per_sector
-            else:
-                n_changed = len(holdings.symmetric_difference(prev_holdings))
-                cost = n_changed * ROUND_TRIP_RATE * weight_per_sector
+            weights_held = {s: weights.get(s, 0) for s in SECTOR_ETFS}
 
+        active_holdings = {s for s in SECTOR_ETFS if weights_held.get(s, 0) > 1e-8}
+        if not active_holdings:
+            active_holdings = holdings
+        period_ret = sum(
+            test_df[test_df["sector"] == s]["fwd_ret_20d"].values[0] * weights_held.get(s, 0)
+            for s in active_holdings if s in test_df["sector"].values
+        )
+
+        cost = sector_rebalance_cost
+
+        # --- Audit capture (governance only, no strategy impact) ---
+        do_capture = False
+        if audit_capture is not None and audit_capture_date is not None:
+            if audit_capture_date == "first_2022" and pd.Timestamp(test_date) >= pd.Timestamp("2022-01-01") and "rebalance_date" not in audit_capture:
+                do_capture = True
+            elif str(test_date)[:10] == audit_capture_date:
+                do_capture = True
+        if do_capture:
+            audit_capture["rebalance_date"] = str(test_date)[:10]
+            audit_capture["gross_return"] = period_ret
+            audit_capture["cost_deducted"] = cost
+            audit_capture["net_return"] = period_ret - cost
+            audit_capture["turnover_raw"] = turnover_raw
+            audit_capture["turnover_after_caps"] = turnover
+            audit_capture["cost_rate_applied"] = ROUND_TRIP_RATE
+            audit_capture["n_sectors_changed"] = len(holdings.symmetric_difference(prev_holdings)) if prev_holdings is not None else TOP_K
+
+        # --- Monitoring only: p_crisis_weekly_log (does NOT affect period_ret or cost) ---
+        if weekly_guard_log is not None and raw_for_guard is not None and (
+            (hmm_X is not None and len(hmm_X) > 0 and hmm_dates is not None)
+            or (regime_df is not None and not regime_df.empty)
+        ):
+            period_end_idx = min(test_start_idx + REBALANCE_DAYS, n_dates)
+            prev_scale = 1.0
+            use_expanding = hmm_X is not None and len(hmm_X) > 0 and hmm_dates is not None
+            if use_expanding:
+                from src.strategy_analyzer import get_p_crisis_expanding
+            else:
+                from src.strategy_analyzer import get_p_crisis_asof
+            for sub_start in range(test_start_idx, period_end_idx, WEEKLY_GUARD_DAYS):
+                sub_end = min(sub_start + WEEKLY_GUARD_DAYS, period_end_idx)
+                if sub_start >= sub_end:
+                    continue
+                sub_start_date = dates[sub_start]
+                sub_end_date = dates[sub_end - 1]
+                if use_expanding:
+                    p_crisis_sub = get_p_crisis_expanding(hmm_X, hmm_dates, pd.Timestamp(sub_start_date))
+                else:
+                    p_crisis_sub = get_p_crisis_asof(pd.Timestamp(sub_start_date), regime_df)
+                scale = P_CRISIS_GUARD_SCALE if p_crisis_sub > P_CRISIS_GUARD_THRESHOLD else 1.0
+                scale_changed = abs(scale - prev_scale) > 1e-6
+                prev_scale = scale
+                sub_ret = _get_subperiod_return(raw_for_guard, sub_start_date, sub_end_date, holdings, weights_held)
+                weekly_guard_log.append({
+                    "rebalance_date": test_date,
+                    "sub_start_date": sub_start_date,
+                    "sub_end_date": sub_end_date,
+                    "p_crisis": p_crisis_sub,
+                    "scale": scale,
+                    "sub_ret": sub_ret,
+                    "scale_changed": scale_changed,
+                })
         gross_rets.append(period_ret)
         net_rets.append(period_ret - cost)
         rebal_dates.append(test_date)
+        turnover_list.append(turnover)
+        if weights_log is not None:
+            w_full = {s: weights_held.get(s, 0) for s in SECTOR_ETFS}
+            weights_log.append((test_date, w_full, cost, False))
         prev_holdings = holdings
         prev_weights = {s: weights.get(s, 0) for s in SECTOR_ETFS} if weights else None
 
-    return gross_rets, net_rets, rebal_dates
+    return gross_rets, net_rets, rebal_dates, turnover_list
 
 
 def _metrics(returns: list[float]) -> dict:
@@ -481,8 +617,13 @@ def _block_bootstrap_cvar(
     alpha: float = 0.95,
     n_iter: int = 1000,
     block_size: Optional[int] = None,
+    random_seed: Optional[int] = None,
 ) -> tuple[float, float, float]:
     """Block bootstrap for CVaR: point estimate and 95% CI."""
+    from src.config import RANDOM_SEED
+    if random_seed is None:
+        random_seed = RANDOM_SEED
+    rng = np.random.default_rng(random_seed)
     arr = np.array(returns)
     n_tail = max(1, int(len(arr) * (1 - alpha)))
     if len(arr) < 20:
@@ -491,11 +632,11 @@ def _block_bootstrap_cvar(
         cvar = float(np.mean(tail))
         return cvar, cvar, cvar
     cvar_obs = float(np.mean(np.partition(arr, n_tail - 1)[:n_tail]))
-    bs = block_size or np.random.randint(BLOCK_SIZE_MIN, BLOCK_SIZE_MAX + 1)
+    bs = block_size or int(rng.integers(BLOCK_SIZE_MIN, BLOCK_SIZE_MAX + 1))
     cvar_boot = []
     for _ in range(n_iter):
         n_blocks = (len(arr) + bs - 1) // bs
-        idx = np.random.randint(0, len(arr) - bs + 1, n_blocks)
+        idx = rng.integers(0, len(arr) - bs + 1, n_blocks)
         resampled = []
         for i in idx:
             resampled.extend(arr[i : i + bs].tolist())
@@ -681,12 +822,17 @@ def _save_param_heatmap(out_dir: Path, raw_path: Optional[Path]) -> None:
     gross_before_diag = np.full((len(cap_values), len(fear_thresh)), np.nan)
     gross_after_diag = np.full((len(cap_values), len(fear_thresh)), np.nan)
     cap_binding_pct_diag = np.full((len(cap_values), len(fear_thresh)), np.nan)
-    for i, cap_val in enumerate(cap_values):
+    try:
+        from tqdm import tqdm
+        cap_iter = tqdm(enumerate(cap_values), total=len(cap_values), desc="Heatmap", unit="cap")
+    except ImportError:
+        cap_iter = enumerate(cap_values)
+    for i, cap_val in cap_iter:
         for j, ft in enumerate(fear_thresh):
             try:
                 gross_log: list = []
                 exposure_diag = {"gross_before": [], "gross_after": [], "cap_binding": []}
-                _, rets, _ = _walk_forward_backtest(
+                _, rets, _, _ = _walk_forward_backtest(
                     df, feature_cols, StandardScaler(),
                     sentiment_series=sentiment_series,
                     use_risk_mgmt=True,
@@ -811,6 +957,122 @@ def _save_chart(
     plt.close()
 
 
+def _generate_risk_governance_report(
+    regime_df: pd.DataFrame,
+    net_rets_rm: list[float],
+    rebal_dates: list,
+    turnover_rm: list[float],
+    net_metrics_rm: dict,
+    net_metrics: dict,
+    out_dir: Path,
+) -> None:
+    """
+    Generate final_risk_governance_report.csv: Crisis ON ratio, annual count,
+    avg duration, Crisis vs Normal return/vol, Turnover, Sharpe.
+    """
+    from src.strategy_analyzer import HYSTERESIS_ENTER
+
+    regime_df = regime_df.copy()
+    regime_df["date"] = pd.to_datetime(regime_df["date"])
+    regime_df = regime_df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+
+    # Crisis ON: hysteresis output = 0.8 when in crisis
+    crisis_on = regime_df["P_Crisis"] >= HYSTERESIS_ENTER - 1e-6
+    total_days = len(regime_df)
+    crisis_days = crisis_on.sum()
+    crisis_on_pct = 100.0 * crisis_days / total_days if total_days > 0 else 0.0
+
+    # Crisis episodes (consecutive crisis days)
+    crisis_episodes = []
+    in_ep = False
+    ep_start = None
+    dates_list = regime_df["date"].tolist()
+    for i in range(len(regime_df)):
+        if crisis_on.iloc[i]:
+            if not in_ep:
+                in_ep = True
+                ep_start = dates_list[i]
+        else:
+            if in_ep:
+                crisis_episodes.append((ep_start, dates_list[i]))
+                in_ep = False
+    if in_ep:
+        crisis_episodes.append((ep_start, dates_list[-1]))
+
+    n_episodes = len(crisis_episodes)
+    durations = []
+    for s, e in crisis_episodes:
+        d = (pd.Timestamp(e) - pd.Timestamp(s)).days
+        durations.append(max(1, d))
+    avg_duration = np.mean(durations) if durations else 0.0
+
+    # Annual crisis count
+    years = (regime_df["date"].max() - regime_df["date"].min()).days / 365.25 if len(regime_df) > 1 else 1.0
+    annual_crisis_count = n_episodes / max(0.01, years)
+
+    # Crisis vs Normal: align rebalance returns with regime
+    from src.strategy_analyzer import get_p_crisis_asof
+    crisis_rets, normal_rets = [], []
+    for i, rd in enumerate(rebal_dates):
+        if i >= len(net_rets_rm):
+            break
+        p = get_p_crisis_asof(pd.Timestamp(rd), regime_df)
+        if p >= HYSTERESIS_ENTER - 1e-6:
+            crisis_rets.append(net_rets_rm[i])
+        else:
+            normal_rets.append(net_rets_rm[i])
+
+    ret_crisis = np.mean(crisis_rets) * 100 if crisis_rets else np.nan
+    vol_crisis = np.std(crisis_rets) * 100 if len(crisis_rets) > 1 else np.nan
+    ret_normal = np.mean(normal_rets) * 100 if normal_rets else np.nan
+    vol_normal = np.std(normal_rets) * 100 if len(normal_rets) > 1 else np.nan
+
+    # Turnover (avg per rebalance)
+    avg_turnover = np.mean(turnover_rm) * 100 if turnover_rm else np.nan
+
+    # 4-state comparison: N/A (deprecated)
+    sharpe_2state = net_metrics_rm["sharpe"]
+    turnover_2state = avg_turnover
+    sharpe_4state = np.nan
+    turnover_4state = np.nan
+    sharpe_improvement = np.nan
+    turnover_improvement = np.nan
+
+    rows = [
+        {"metric": "crisis_on_ratio_pct", "value": crisis_on_pct},
+        {"metric": "annual_crisis_count", "value": annual_crisis_count},
+        {"metric": "avg_crisis_duration_days", "value": avg_duration},
+        {"metric": "ret_crisis_pct", "value": ret_crisis},
+        {"metric": "vol_crisis_pct", "value": vol_crisis},
+        {"metric": "ret_normal_pct", "value": ret_normal},
+        {"metric": "vol_normal_pct", "value": vol_normal},
+        {"metric": "sharpe_2state", "value": sharpe_2state},
+        {"metric": "turnover_2state_pct", "value": turnover_2state},
+        {"metric": "sharpe_4state", "value": sharpe_4state},
+        {"metric": "turnover_4state_pct", "value": turnover_4state},
+        {"metric": "sharpe_improvement_vs_4state", "value": sharpe_improvement},
+        {"metric": "turnover_improvement_vs_4state", "value": turnover_improvement},
+    ]
+    report_df = pd.DataFrame(rows)
+    report_path = out_dir / "final_risk_governance_report.csv"
+    report_df.to_csv(report_path, index=False)
+    print(f"Governance report saved to {report_path}")
+
+    # Console summary
+    print("\n=== RISK GOVERNANCE SUMMARY (2-State Core-Crisis) ===")
+    print(f"  Crisis ON ratio:        {crisis_on_pct:.2f}%")
+    print(f"  Annual crisis count:    {annual_crisis_count:.2f}")
+    print(f"  Avg crisis duration:     {avg_duration:.1f} days")
+    print(f"  Crisis regime:  ret={ret_crisis:.2f}%  vol={vol_crisis:.2f}%")
+    print(f"  Normal regime:  ret={ret_normal:.2f}%  vol={vol_normal:.2f}%")
+    print(f"  Sharpe (2-state):       {sharpe_2state:.4f}")
+    print(f"  Avg Turnover:           {turnover_2state:.2f}%")
+    print("  vs 4-state: N/A (deprecated)")
+    print("=" * 50)
+    print("Transitioning to Robust 2-state Framework: Prioritizing Operational Efficiency and Governance over Model Complexity.")
+    print("=" * 50 + "\n")
+
+
 def run(
     processed_path: Optional[Path] = None,
     raw_path: Optional[Path] = None,
@@ -842,17 +1104,87 @@ def run(
     start = raw.index.min().strftime("%Y-%m-%d")
     end = raw.index.max().strftime("%Y-%m-%d")
     regime_df = pd.DataFrame()
+    hmm_model, bic_info = None, {}
     try:
         from src.strategy_analyzer import get_hmm_regime_model
-        _, regime_df = get_hmm_regime_model(start=start, end=end)
-    except Exception:
-        pass
+        hmm_model, regime_df, bic_info = get_hmm_regime_model(start=start, end=end)
+        if regime_df.empty:
+            print("[HMM] get_hmm_regime_model returned empty regime_df")
+        else:
+            print(f"[HMM] get_hmm_regime_model OK: {len(regime_df)} rows")
+    except Exception as e:
+        print(f"[HMM] get_hmm_regime_model failed: {type(e).__name__}: {e}")
 
-    gross_rets, net_rets, rebal_dates = _walk_forward_backtest(
+    # HMM Model Diagnostics
+    if hmm_model is not None and not regime_df.empty and bic_info:
+        selected_n = bic_info.get("selected_n")
+        log_lik = bic_info.get("log_likelihood")
+        occupancy = bic_info.get("occupancy", {})
+        feature_means = bic_info.get("feature_means_per_state", {})
+        print("\n=== HMM MODEL DIAGNOSTICS ===")
+        print("Selected n_components:", selected_n)
+        print("Log-likelihood:", log_lik)
+        print("Occupancy:", occupancy)
+
+        hidden_states = regime_df["state"].values
+        unique, counts = np.unique(hidden_states, return_counts=True)
+        total = counts.sum()
+        occ = {int(u): float(c / total) for u, c in zip(unique, counts)} if total > 0 else occupancy
+        print("\nState Occupancy:")
+        for k in sorted(occ.keys()):
+            print(f"  State {k}: {occ[k]:.4f}")
+
+        inactive_states = [k for k, v in occ.items() if v < 0.05]
+        print("\nInactive States (<5%):", inactive_states)
+
+        print("\nTransition Matrix:")
+        print(hmm_model.transmat_)
+        print("\nStart Probabilities:")
+        print(hmm_model.startprob_)
+
+        # Per-state performance + feature means
+        diag_rows = []
+        if "forward_ret_20d" in regime_df.columns:
+            df_diag = regime_df.dropna(subset=["forward_ret_20d"]).copy()
+            if len(df_diag) > 0:
+                for s in sorted(df_diag["state"].unique()):
+                    subset = df_diag[df_diag["state"] == s]["forward_ret_20d"]
+                    if len(subset) > 0:
+                        q05 = subset.quantile(0.05)
+                        cvar_95 = subset[subset <= q05].mean()
+                        row = {
+                            "state": int(s),
+                            "count": len(subset),
+                            "mean_return": float(subset.mean()),
+                            "volatility": float(subset.std()) if len(subset) > 1 else 0.0,
+                            "cvar_95": float(cvar_95),
+                        }
+                        for fname, fval in feature_means.get(int(s), {}).items():
+                            row[f"feat_{fname}"] = fval
+                        diag_rows.append(row)
+        else:
+            for s, fm in feature_means.items():
+                row = {"state": int(s), "count": 0, "mean_return": np.nan, "volatility": np.nan, "cvar_95": np.nan}
+                for fname, fval in fm.items():
+                    row[f"feat_{fname}"] = fval
+                diag_rows.append(row)
+
+        if diag_rows:
+            summary_df = pd.DataFrame(diag_rows)
+            print("\nPer-State Performance (+ Feature Means):")
+            print(summary_df.to_string(index=False))
+            summary_df.to_csv(out_dir / "hmm_full_diagnostics.csv", index=False)
+            print(f"\nDiagnostics saved to {out_dir / 'hmm_full_diagnostics.csv'}")
+        print("=== END DIAGNOSTIC ===\n")
+
+    print("[INFO] Running backtest (Net, no risk mgmt)...")
+    gross_rets, net_rets, rebal_dates, _ = _walk_forward_backtest(
         df, feature_cols, scaler,
         sentiment_series=sentiment_series,
         use_risk_mgmt=False,
+        show_progress=True,
     )
+    print("[INFO] Calculating risk metrics (Net)...")
     gross_metrics = _metrics(gross_rets)
     net_metrics = _metrics(net_rets)
 
@@ -860,10 +1192,18 @@ def run(
     try:
         from src.strategy_analyzer import get_hmm_input_data
         hmm_X, hmm_dates = get_hmm_input_data(start, end)
-    except Exception:
-        pass
+        if len(hmm_X) == 0 or len(hmm_dates) == 0:
+            print("[HMM] get_hmm_input_data returned empty — monitoring log may be limited")
+        else:
+            print(f"[HMM] get_hmm_input_data OK: {len(hmm_X)} rows, {len(hmm_dates)} dates")
+    except Exception as e:
+        print(f"[HMM] get_hmm_input_data failed: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+    print("[INFO] Running backtest (Net + Risk Mgmt)...")
     p_crisis_log: list = []
-    gross_rets_rm, net_rets_rm, _ = _walk_forward_backtest(
+    weekly_guard_log: list = []
+    gross_rets_rm, net_rets_rm, rebal_dates_rm, turnover_rm = _walk_forward_backtest(
         df, feature_cols, scaler,
         sentiment_series=sentiment_series,
         use_risk_mgmt=True,
@@ -873,10 +1213,21 @@ def run(
         hmm_dates=hmm_dates if len(hmm_dates) > 0 else None,
         use_institutional=True,
         p_crisis_log=p_crisis_log,
+        weekly_guard_log=weekly_guard_log,
+        show_progress=True,
     )
     if p_crisis_log:
         pd.DataFrame(p_crisis_log).to_csv(out_dir / "p_crisis_log.csv", index=False)
         print(f"P_Crisis log saved to {out_dir / 'p_crisis_log.csv'}")
+    if weekly_guard_log:
+        pd.DataFrame(weekly_guard_log).to_csv(out_dir / "p_crisis_weekly_log.csv", index=False)
+        print(f"Monitoring log saved to {out_dir / 'p_crisis_weekly_log.csv'} ({len(weekly_guard_log)} rows)")
+    else:
+        pd.DataFrame(columns=["rebalance_date", "sub_start_date", "sub_end_date", "p_crisis", "scale", "sub_ret", "scale_changed"]).to_csv(
+            out_dir / "p_crisis_weekly_log.csv", index=False
+        )
+        print(f"[HMM] Monitoring log empty — created empty p_crisis_weekly_log.csv")
+    print("[INFO] Calculating risk metrics (Net + Risk Mgmt)...")
     net_metrics_rm = _metrics(net_rets_rm)
 
     # Final model on full data
@@ -893,7 +1244,6 @@ def run(
         n_estimators=N_ESTIMATORS,
         scale_pos_weight=scale_pos,
         random_state=RANDOM_STATE,
-        use_label_encoder=False,
         eval_metric="logloss",
     )
     final_model.fit(X_all_s, y_all)
@@ -904,12 +1254,27 @@ def run(
     print(f"Model saved to {model_path}")
 
     # Chart (Gross, Net, Net+RiskMgmt)
+    print("[INFO] Generating chart...")
     chart_path = out_dir / "backtest_chart.png"
     _save_chart(gross_rets, net_rets, rebal_dates, chart_path, net_rets_rm=net_rets_rm)
+    print("[INFO] Generating param stability heatmap...")
     _save_param_heatmap(out_dir, raw_path)
 
+    print("[INFO] Calculating CVaR and MDD periods...")
     cvar_pt, cvar_lo, cvar_hi = _block_bootstrap_cvar(net_rets_rm, alpha=CVAR_ALPHA, n_iter=BLOCK_BOOTSTRAP_ITER)
     worst_mdd = _find_worst_mdd_periods_nonoverlapping(net_rets_rm, rebal_dates, n=5)
+
+    # Risk Governance Report (2-state Core-Crisis)
+    if regime_df is not None and not regime_df.empty and len(net_rets_rm) == len(rebal_dates) and len(turnover_rm) == len(rebal_dates):
+        _generate_risk_governance_report(
+            regime_df=regime_df,
+            net_rets_rm=net_rets_rm,
+            rebal_dates=rebal_dates,
+            turnover_rm=turnover_rm,
+            net_metrics_rm=net_metrics_rm,
+            net_metrics=net_metrics,
+            out_dir=out_dir,
+        )
     report = _render_report(
         gross_metrics, net_metrics, net_metrics_rm,
         COST_RATE, gross_rets, net_rets,
@@ -920,9 +1285,19 @@ def run(
         cvar_ci=(cvar_lo, cvar_hi),
         worst_mdd=worst_mdd,
     )
+    print("[INFO] Rendering report...")
     report_path = out_dir / "backtest_report.md"
     report_path.write_text(report, encoding="utf-8")
-    print(f"Backtest report saved to {report_path}")
+
+    # Final summary
+    print("\n" + "=" * 50)
+    print("BACKTEST COMPLETE — Summary")
+    print("=" * 50)
+    print(f"  Net:           Sharpe = {net_metrics['sharpe']:.4f}  |  Cum Return = {net_metrics['cum_return']*100:.2f}%")
+    print(f"  Net+RiskMgmt:  Sharpe = {net_metrics_rm['sharpe']:.4f}  |  Cum Return = {net_metrics_rm['cum_return']*100:.2f}%")
+    print("=" * 50)
+    print(f"Report saved to {report_path}")
+    print("=" * 50 + "\n")
 
     return {"gross": gross_metrics, "net": net_metrics, "net_with_risk_mgmt": net_metrics_rm}
 
@@ -973,6 +1348,7 @@ def _render_report(
         "- **HMM (BIC selection, diag cov)**: Expanding-window inference. Risk_Multiplier = 1 - P_Crisis.",
         f"- **Vol Scaling**: Target_Vol = {TARGET_VOL*100}%, Weight ∝ Target_Vol / Sector_Vol. Kelly Cap = {KELLY_FRACTION} Kelly.",
         f"- **Turnover**: Skip < {TURNOVER_THRESHOLD*100}%; Cap > {TURNOVER_CAP_THRESHOLD*100}%.",
+        "- **Weekly Guard**: Removed from trading. `p_crisis_weekly_log.csv` is monitoring-only (dashboard).",
         "",
         "### Impact",
         f"- **MDD change**: {mdd_str}",
@@ -995,9 +1371,10 @@ def _render_report(
         f"- Features: {', '.join(features)}",
         f"- max_depth: {MAX_DEPTH}, learning_rate: {LEARNING_RATE}",
         "",
-        "## Charts",
+        "## Charts & Logs",
         "- `outputs/backtest_chart.png` — Cumulative return (Gross, Net, Risk-Managed)",
         "- `outputs/param_stability_heatmap.png` — Sharpe vs Fear threshold",
+        "- `outputs/p_crisis_weekly_log.csv` — 5일 단위 p_crisis, scale, scale_changed (주간 리스크 관리 검증)",
         "",
     ])
     return "\n".join(lines)
@@ -1020,7 +1397,6 @@ def train_model(
         n_estimators=kwargs.get("n_estimators", N_ESTIMATORS),
         scale_pos_weight=scale_pos_weight,
         random_state=kwargs.get("random_state", RANDOM_STATE),
-        use_label_encoder=False,
         eval_metric="logloss",
     )
     model.fit(X, y)
@@ -1035,4 +1411,15 @@ def predict(model: xgb.XGBClassifier, X: pd.DataFrame, proba: bool = True):
 
 
 if __name__ == "__main__":
-    run()
+    import argparse
+    parser = argparse.ArgumentParser(description="Phase 4: Model training & backtest")
+    parser.add_argument("--tag", type=str, default=None,
+                        help="Run ID: write outputs to outputs/<tag>/ instead of outputs/. Default: overwrite outputs/")
+    args = parser.parse_args()
+    out_dir = None
+    if args.tag:
+        root = Path(__file__).resolve().parent.parent
+        out_dir = root / "outputs" / args.tag
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Tagged run: outputs will be written to {out_dir}")
+    run(out_dir=out_dir)
