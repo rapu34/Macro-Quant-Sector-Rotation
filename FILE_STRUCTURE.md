@@ -5,6 +5,7 @@ Automatic investing program/
 │
 ├── PROJECT_REPORT.md          # Main portfolio report
 ├── README.md
+├── run_pipeline.py            # One-command full pipeline
 ├── FILE_STRUCTURE.md          # This file
 ├── requirements.txt
 ├── .env                        # FRED_API_KEY (git-ignored)
@@ -25,6 +26,11 @@ Automatic investing program/
 │   ├── raw_data_extended_2005.csv
 │   ├── processed_features.csv
 │   └── processed_features_extended_2005.csv
+│
+├── data_refresh/               # Refresh mode data (git-ignored)
+│   ├── raw_data.csv
+│   ├── processed_features.csv
+│   └── daily/                  # raw_YYYY-MM-DD.csv (date-based snapshots)
 │
 ├── outputs/                    # Production outputs (git-ignored)
 │   ├── model.pkl               # Trained XGBoost model
@@ -70,12 +76,23 @@ Automatic investing program/
 │           ├── README.md
 │           └── ... (83 files)
 │
+├── outputs_refresh/             # Refresh mode outputs (git-ignored)
+│   ├── strategy_report.md
+│   ├── selected_features.json
+│   └── .last_scheduled_run      # Last run date for 21-day automation
+│
+├── experiments/outputs_refresh/ # Refresh mode experiment outputs (git-ignored)
+│
+├── logs/                        # Scheduled run logs (git-ignored)
+│   └── scheduled.log
+│
 ├── dev_logs/                    # Development logs (git-ignored)
 │   ├── README.md
 │   ├── dev_log.md               # Development flow and decisions
 │   └── experimental_details.md  # Experimental details (content moved from Section 3)
 │
 ├── scripts/                     # Utility scripts
+│   ├── run_scheduled_refresh.py  # 21-day rebalance automation (refresh mode)
 │   ├── run_governance_audit.py
 │   ├── validation_audit.py
 │   └── robustness_oos_evaluation.py
@@ -89,10 +106,16 @@ Automatic investing program/
 
 ## Main Pipeline Execution Order
 
+**One command:** `python run_pipeline.py`
+
+**Refresh mode (live data):** `python run_pipeline.py --mode refresh` → writes to `*_refresh/` dirs.
+
+**Scheduled (21-day cycle):** `python scripts/run_scheduled_refresh.py` → runs refresh only when 21 trading days have passed.
+
 | Step | Script | Output |
 |------|--------|--------|
-| 1 | `true_daily_returns.py` | true_daily_block1.csv, true_daily_block2.csv |
-| 2 | `block2_hmm_expanding_variants.py` | block2_hmm_expanding_rebalonly.csv |
-| 3 | `factor_regression.py` | factor exposure (SPY/VIX required) |
-| 4 | `factor_regression_validation.py` | factor_regression_validation_report.md |
-| 5 | `stress_test.py` | stress_test_report.md |
+| 1 | `python experiments/scripts/true_daily_returns.py` | true_daily_block1.csv, true_daily_block2.csv |
+| 2 | `python experiments/scripts/block2_hmm_expanding_variants.py` | block2_hmm_expanding_rebalonly.csv |
+| 3 | `python experiments/scripts/factor_regression.py` | factor exposure (SPY/VIX required) |
+| 4 | `python experiments/scripts/factor_regression_validation.py` | factor_regression_validation_report.md |
+| 5 | `python experiments/scripts/stress_test.py` | stress_test_report.md |

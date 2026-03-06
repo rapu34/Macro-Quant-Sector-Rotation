@@ -323,11 +323,53 @@ def load_all(
     return macro_df, sector_df
 
 
+def _save_daily_raw(merged: pd.DataFrame, daily_dir: Path) -> None:
+    """
+    Save each date's row to data_refresh/daily/raw_YYYY-MM-DD.csv.
+    Used in refresh mode for date-based storage (audit, incremental).
+    """
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    merged.index = pd.to_datetime(merged.index)
+    for dt in merged.index:
+        date_str = dt.strftime("%Y-%m-%d")
+        row_path = daily_dir / f"raw_{date_str}.csv"
+        row_df = merged.loc[[dt]]
+        row_df.to_csv(row_path)
+
+
+def load_raw_from_daily(daily_dir: Path) -> Optional[pd.DataFrame]:
+    """
+    Load raw_data by concatenating all raw_YYYY-MM-DD.csv in daily_dir.
+    Returns None if no daily files exist.
+    """
+    if not daily_dir.exists():
+        return None
+    files = sorted(daily_dir.glob("raw_*.csv"))
+    if not files:
+        return None
+    frames = []
+    for f in files:
+        try:
+            df = pd.read_csv(f, index_col=0, parse_dates=True)
+            frames.append(df)
+        except Exception:
+            continue
+    if not frames:
+        return None
+    return pd.concat(frames, axis=0).sort_index().drop_duplicates()
+
+
 if __name__ == "__main__":
+    import os
     from datetime import datetime, timedelta
 
+    root = Path(__file__).resolve().parent.parent
+    _refresh = os.environ.get("PIPELINE_REFRESH_MODE") == "1"
+    _data_dir = root / ("data_refresh" if _refresh else "data")
+    _daily_dir = _data_dir / "daily" if _refresh else None
+
     end_d = datetime.now()
-    start_d = end_d - timedelta(days=365 * 5)
+    start_d = end_d - timedelta(days=365 * 21)  # ~21 years for extended-like range
     start_str = start_d.strftime("%Y-%m-%d")
     end_str = end_d.strftime("%Y-%m-%d")
 
@@ -335,10 +377,15 @@ if __name__ == "__main__":
         macro, sector = load_all(start=start_str, end=end_str)
         merged = pd.concat([macro, sector], axis=1, join="inner")
 
-        out_path = Path(__file__).resolve().parent.parent / "data" / "raw_data.csv"
+        out_path = _data_dir / "raw_data.csv"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         merged.to_csv(out_path)
-        print("Data saved to data/raw_data.csv")
+        print(f"Data saved to {out_path}")
+
+        if _refresh and _daily_dir is not None:
+            _save_daily_raw(merged, _daily_dir)
+            n_days = len(merged)
+            print(f"Daily snapshots saved to {_daily_dir}/raw_YYYY-MM-DD.csv ({n_days} files)")
     except RuntimeError as e:
         print("Error:", e)
         raise

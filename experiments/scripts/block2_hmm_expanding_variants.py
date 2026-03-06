@@ -14,10 +14,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import os
+
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-EXP_OUT = Path(__file__).resolve().parent.parent / "outputs"
+_suffix = "_refresh" if os.environ.get("PIPELINE_REFRESH_MODE") == "1" else ""
+EXP_OUT = Path(__file__).resolve().parent.parent / f"outputs{_suffix}"
 REBALANCE_B2 = 21
 MOMENTUM_LOOKBACK = 252
 

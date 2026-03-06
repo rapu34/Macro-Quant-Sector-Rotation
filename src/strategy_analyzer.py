@@ -311,10 +311,12 @@ def run(
     selected_features : list of validated feature names
     report_text : full markdown report string
     """
+    import os
     root = Path(__file__).resolve().parent.parent
-    processed_path = Path(processed_path or root / "data" / "processed_features.csv")
-    report_path = Path(report_path or root / "outputs" / "strategy_report.md")
-    features_path = Path(features_path or root / "outputs" / "selected_features.json")
+    _suffix = "_refresh" if os.environ.get("PIPELINE_REFRESH_MODE") == "1" else ""
+    processed_path = Path(processed_path or root / f"data{_suffix}" / "processed_features.csv")
+    report_path = Path(report_path or root / f"outputs{_suffix}" / "strategy_report.md")
+    features_path = Path(features_path or root / f"outputs{_suffix}" / "selected_features.json")
 
     df = _load_data(processed_path)
     feature_cols = _get_feature_columns(df)
@@ -339,7 +341,7 @@ def run(
         end = processed_raw["date"].max().strftime("%Y-%m-%d")
         _, regime_df, _ = get_hmm_regime_model(start=start, end=end)
         if not regime_df.empty:
-            regime_df.to_csv(root / "outputs" / "hmm_regime.csv", index=False)
+            regime_df.to_csv(root / f"outputs{_suffix}" / "hmm_regime.csv", index=False)
     except Exception:
         pass
 
@@ -388,7 +390,7 @@ def _load_hmm_features_4d(start: Optional[str] = None, end: Optional[str] = None
     """
     Load 4D features for HMM:
     a) Credit Stress: HYG ret - IEF ret (return difference)
-    b) Vol Term Structure: VIX / VXV ratio
+    b) Vol Term Structure: VIX / VIX3M ratio
     c) Sector Dispersion: cross-sectional std of 11 sector returns
     d) Market Momentum: SPY price vs 20d MA distance (log ratio)
     Returns (DataFrame with date + 4 cols, scaler fit on data).
@@ -407,7 +409,7 @@ def _load_hmm_features_4d(start: Optional[str] = None, end: Optional[str] = None
         return c.squeeze()
 
     closes = {}
-    for t in ["HYG", "IEF", "SPY", "^VIX", "^VIX3M", "^VXV"] + list(SECTOR_ETFS_11):
+    for t in ["HYG", "IEF", "SPY", "^VIX", "^VIX3M"] + list(SECTOR_ETFS_11):
         s = _get_close(t)
         if not s.empty:
             closes[t] = s
@@ -430,9 +432,9 @@ def _load_hmm_features_4d(start: Optional[str] = None, end: Optional[str] = None
     ief_ret = np.log(ief / ief.shift(1))
     credit_stress = (hyg_ret - ief_ret).dropna()
 
-    # b) Vol Term: VIX / VIX3M (VXV may be delisted; ^VIX3M = 3-month VIX)
+    # b) Vol Term: VIX / VIX3M (^VIX3M = 3-month VIX)
     vix = closes.get("^VIX", pd.Series(dtype=float)).reindex(common_idx).ffill().bfill().replace(0, np.nan)
-    vix3m = closes.get("^VIX3M", closes.get("^VXV", pd.Series(dtype=float))).reindex(common_idx).ffill().bfill().replace(0, np.nan)
+    vix3m = closes.get("^VIX3M", pd.Series(dtype=float)).reindex(common_idx).ffill().bfill().replace(0, np.nan)
     vol_term = (vix / vix3m).replace(np.inf, np.nan)
 
     # c) Sector Dispersion: cross-sectional std of sector returns

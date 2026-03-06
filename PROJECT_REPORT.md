@@ -207,11 +207,13 @@ This section summarizes the main design decisions and their implications. Detail
 
 ## 8. Main Pipeline Execution Order
 
-1. `true_daily_returns.py` → block1, block2 CSV
-2. `block2_hmm_expanding_variants.py` → block2_hmm_rebalonly.csv
-3. `factor_regression.py` → factor exposure (SPY/VIX required)
-4. `factor_regression_validation.py` → risk audit
-5. `stress_test.py` → stress_test_report.md
+**One command:** `python run_pipeline.py`
+
+1. `python experiments/scripts/true_daily_returns.py` → block1, block2 CSV
+2. `python experiments/scripts/block2_hmm_expanding_variants.py` → block2_hmm_expanding_rebalonly.csv
+3. `python experiments/scripts/factor_regression.py` → factor exposure (SPY/VIX required)
+4. `python experiments/scripts/factor_regression_validation.py` → risk audit
+5. `python experiments/scripts/stress_test.py` → stress_test_report.md
 
 ---
 

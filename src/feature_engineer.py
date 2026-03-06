@@ -278,17 +278,20 @@ def run_and_save(
     Parameters
     ----------
     raw_path : str or Path, optional
-        Default: project_root/data/raw_data.csv
+        Default: project_root/data/raw_data.csv (or data_refresh/ when PIPELINE_REFRESH_MODE=1)
     out_path : str or Path, optional
-        Default: project_root/data/processed_features.csv
+        Default: project_root/data/processed_features.csv (or data_refresh/ when PIPELINE_REFRESH_MODE=1)
 
     Returns
     -------
     X, y : feature matrix and target
     """
+    import os
     root = Path(__file__).resolve().parent.parent
-    raw_path = raw_path or root / "data" / "raw_data.csv"
-    out_path = out_path or root / "data" / "processed_features.csv"
+    _suffix = "_refresh" if os.environ.get("PIPELINE_REFRESH_MODE") == "1" else ""
+    _data = root / f"data{_suffix}"
+    raw_path = raw_path or _data / "raw_data.csv"
+    out_path = out_path or _data / "processed_features.csv"
 
     X, y = build_features(raw_path=raw_path)
 
@@ -296,7 +299,7 @@ def run_and_save(
     out_df["target"] = y
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(out_path)
-    print("Data saved to data/processed_features.csv")
+    print(f"Data saved to {out_path}")
 
     return X, y
 

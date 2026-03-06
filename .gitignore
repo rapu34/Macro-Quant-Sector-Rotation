@@ -1,7 +1,11 @@
 .env
 data/
+data_refresh/
 outputs/
+outputs_refresh/
 dev_logs/
+logs/
+experiments/outputs_refresh/
 *.pkl
 *.joblib
 .venv/
@@ -10,3 +14,4 @@ dev_logs/
 ~$*
 __pycache__/
 *.pyc
+.streamlit/

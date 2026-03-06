@@ -6,6 +6,7 @@ Replaces period-return-spread with: r_p,t = Σ(w_i,t-1 × r_i,t)
 where r_i,t = (P_t / P_{t-1}) - 1 (simple return).
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -13,9 +14,10 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = ROOT / "data"
-EXP_DATA = Path(__file__).resolve().parent.parent / "data"
-EXP_OUT = Path(__file__).resolve().parent.parent / "outputs"
+_suffix = "_refresh" if os.environ.get("PIPELINE_REFRESH_MODE") == "1" else ""
+DATA_DIR = ROOT / f"data{_suffix}"
+EXP_DATA = Path(__file__).resolve().parent.parent / f"data{_suffix}"
+EXP_OUT = Path(__file__).resolve().parent.parent / f"outputs{_suffix}"
 sys.path.insert(0, str(ROOT))
 
 from src.config import SECTOR_ETFS
@@ -49,7 +51,7 @@ def _get_block1_weight_timeline(raw_path: Path, proc_path: Path) -> list:
     )
     from sklearn.preprocessing import StandardScaler
 
-    selected_path = ROOT / "outputs" / "selected_features.json"
+    selected_path = ROOT / f"outputs{_suffix}" / "selected_features.json"
     df = _load_data(proc_path, raw_path)
     feature_cols = _get_feature_cols(df, selected_path)
     feature_cols = [c for c in feature_cols if c in df.columns]
@@ -194,7 +196,7 @@ def main():
 
     raw_path = DATA_DIR / "raw_data_extended_2005.csv"
     proc_path = DATA_DIR / "processed_features_extended_2005.csv"
-    if not raw_path.exists() and (EXP_DATA / "raw_data_extended_2005.csv").exists():
+    if not raw_path.exists() and not _suffix and (EXP_DATA / "raw_data_extended_2005.csv").exists():
         import shutil
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copy(EXP_DATA / "raw_data_extended_2005.csv", raw_path)
