@@ -102,10 +102,11 @@ Build an automated investment pipeline that combines macroeconomic indicators an
 [Phase 4] Block1 — Model Trainer
     └─ Walk-forward XGBoost (expanding window, MIN_TRAIN_PCT=40%)
     └─ HMM risk_mult = clip(1 - p_crisis, 0.5, 1.0)
+    └─ Turnover cap: >25% → move 50% toward target (cost reduction)
     └─ model.pkl, true_daily_block1.csv
 
 [Phase 5] Block2 — Momentum + HMM
-    └─ 12M-1M momentum Top 3, 21-day rebalance
+    └─ 12M-1M momentum Top 3, 21-day rebalance (turnover cap not applied — immediate reflection on target change)
     └─ HMM_REBAL_ONLY: risk_mult at rebalance only
     └─ block2_hmm_expanding_rebalonly.csv
 
@@ -134,6 +135,7 @@ This section summarizes the main design decisions and their implications. Detail
 | **Data horizon (5y vs 15y)** | 2005–2026 for stress test; Block1 warm-up 2005–2013 | Regime-sensitive strategies can suffer from long-horizon noise; MIN_TRAIN_PCT=40% drives warm-up |
 | **HMM scaling** | Expanding fit only on data up to asof_date | Verified no look-ahead; PASS |
 | **Hysteresis state** | Stateful within expanding window | Verified sequential in_crisis maintenance; PASS |
+| **Turnover cap (Block1 vs Block2)** | Block1 only | Block1: High ML prediction volatility → turnover cap for cost reduction. Block2: 12M momentum has low rank turnover → cap not applied, immediate reflection on target change |
 
 ---
 
@@ -169,8 +171,8 @@ This section summarizes the main design decisions and their implications. Detail
 
 | Component | Description |
 |-----------|--------------|
-| **Block1** | XGBoost sector rotation. Stored in model.pkl. 20-day rebalance |
-| **Block2** | 12M-1M momentum (rule-based). 21-day rebalance. No XGBoost |
+| **Block1** | XGBoost sector rotation. 20-day rebalance. Turnover cap (>25% → 50% move) applied |
+| **Block2** | 12M-1M momentum (rule-based). 21-day rebalance. Turnover cap not applied (immediate reflection on target change) |
 | **HMM** | Expanding fit. get_p_crisis_expanding. Not stored in model.pkl |
 | **Features** | volatility_20d, sentiment_dispersion, cpi_all_urban_zscore_lag20, etc. |
 | **Target** | 20-day forward relative return Top 3 = 1, else 0 |

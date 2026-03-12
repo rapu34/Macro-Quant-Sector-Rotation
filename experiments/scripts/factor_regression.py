@@ -178,8 +178,12 @@ def main():
     beta_vol = betas.get("delta_vix", np.nan)
     has_alpha = abs(tstat_alpha) > 1.96
 
-    # Save
+    # Save (include r_p, r_mkt, delta_vix for benchmark comparison and alerts)
     EXP_OUT.mkdir(parents=True, exist_ok=True)
+    save_cols = ["r_p", "r_mkt"]
+    if "delta_vix" in merged.columns:
+        save_cols.append("delta_vix")
+    merged[save_cols].rename(columns={"r_mkt": "r_spy"}).to_csv(EXP_OUT / "benchmark_factor_data.csv")
     df_summary.to_csv(EXP_OUT / "factor_regression_summary.csv", index=False)
     df_roll.to_csv(EXP_OUT / "factor_rolling_betas.csv", index=False)
     df_crisis.to_csv(EXP_OUT / "factor_regression_crisis.csv", index=False)

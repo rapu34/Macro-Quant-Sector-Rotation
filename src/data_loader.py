@@ -368,7 +368,7 @@ if __name__ == "__main__":
     _data_dir = root / ("data_refresh" if _refresh else "data")
     _daily_dir = _data_dir / "daily" if _refresh else None
 
-    end_d = datetime.now()
+    end_d = datetime.now() + timedelta(days=3)  # +3 days: yfinance end exclusive + typical 1–2 day delay
     start_d = end_d - timedelta(days=365 * 21)  # ~21 years for extended-like range
     start_str = start_d.strftime("%Y-%m-%d")
     end_str = end_d.strftime("%Y-%m-%d")

@@ -27,6 +27,7 @@ REPRO_STEPS = [
     ("Factor Regression", "experiments/scripts/factor_regression.py"),
     ("Factor Regression Validation", "experiments/scripts/factor_regression_validation.py"),
     ("Stress Test", "experiments/scripts/stress_test.py"),
+    ("Benchmark Comparison", "experiments/scripts/benchmark_comparison.py"),
 ]
 
 REFRESH_PREP_STEPS = [
@@ -89,6 +90,11 @@ def run_repro(args) -> int:
             print(f"\n[ERROR] Step {i} failed (exit {ret.returncode})")
             return ret.returncode
 
+    # Write dashboard state
+    write_script = ROOT / "scripts" / "write_dashboard_state.py"
+    if write_script.exists():
+        subprocess.run([sys.executable, str(write_script)], cwd=str(ROOT), env=env)
+
     print("\n" + "=" * 60)
     print("Repro pipeline completed successfully.")
     print("=" * 60)
@@ -134,6 +140,11 @@ def run_refresh(args) -> int:
         if ret.returncode != 0:
             print(f"\n[ERROR] Step {i} failed (exit {ret.returncode})")
             return ret.returncode
+
+    # Write dashboard state
+    write_script = ROOT / "scripts" / "write_dashboard_state.py"
+    if write_script.exists():
+        subprocess.run([sys.executable, str(write_script)], cwd=str(ROOT), env=env)
 
     print("\n" + "=" * 60)
     print("Refresh pipeline completed successfully.")

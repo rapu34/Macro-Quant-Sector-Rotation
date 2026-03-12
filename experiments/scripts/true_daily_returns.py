@@ -6,6 +6,7 @@ Replaces period-return-spread with: r_p,t = Σ(w_i,t-1 × r_i,t)
 where r_i,t = (P_t / P_{t-1}) - 1 (simple return).
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -279,6 +280,55 @@ def main():
                 "old_cvar": mo["cvar"], "true_cvar": mt["cvar"],
             })
     comp_df = pd.DataFrame(comp_rows)
+
+    # STEP 5.5 — Current holdings (Block1+Block2 30:70) + turnover for dashboard
+    last_date = all_dates[-1]
+    w_b1 = {s: 0.0 for s in SECTOR_ETFS}
+    w_b2 = {s: 0.0 for s in SECTOR_ETFS}
+    if wt_b1:
+        last_b1 = wt_b1[-1]
+        if len(last_b1) >= 2 and not (len(last_b1) > 3 and last_b1[3]):
+            w_b1 = last_b1[1]
+    if wt_b2:
+        w_b2 = wt_b2[-1][1]
+    combined = {s: 0.3 * w_b1.get(s, 0) + 0.7 * w_b2.get(s, 0) for s in SECTOR_ETFS}
+    combined = {s: w for s, w in combined.items() if w > 1e-6}
+    valid_dates = prices.index[prices.index <= last_date]
+    price_date = last_date if last_date in prices.index else (valid_dates[-1] if len(valid_dates) > 0 else None)
+
+    def _turnover(prev: dict, new: dict) -> float:
+        return sum(abs(new.get(s, 0) - prev.get(s, 0)) for s in SECTOR_ETFS)
+
+    last_turnover_b1 = None
+    last_turnover_b2 = None
+    last_turnover_combined = None
+    b1_normal = [(d, w) for d, w, *rest in wt_b1 if (len(rest) < 2 or not rest[1]) and isinstance(w, dict)]
+    if len(b1_normal) >= 2:
+        last_turnover_b1 = _turnover(b1_normal[-2][1], b1_normal[-1][1])
+    if len(wt_b2) >= 2:
+        last_turnover_b2 = _turnover(wt_b2[-2][1], wt_b2[-1][1])
+    if len(b1_normal) >= 2 and len(wt_b2) >= 2:
+        prev_comb = {s: 0.3 * b1_normal[-2][1].get(s, 0) + 0.7 * wt_b2[-2][1].get(s, 0) for s in SECTOR_ETFS}
+        new_comb = {s: 0.3 * b1_normal[-1][1].get(s, 0) + 0.7 * wt_b2[-1][1].get(s, 0) for s in SECTOR_ETFS}
+        last_turnover_combined = _turnover(prev_comb, new_comb)
+
+    if combined and price_date is not None:
+        row = prices.loc[price_date]
+        purchase = {s: float(row[s]) for s in combined if s in row.index and pd.notna(row[s])}
+        holdings_list = [{"ticker": s, "weight": round(w * 100, 2), "purchase_price": round(purchase.get(s, 0), 2)} for s, w in combined.items() if s in purchase]
+        if holdings_list:
+            holdings_data = {
+                "asof_date": str(pd.Timestamp(last_date).date()),
+                "holdings": holdings_list,
+                "last_rebalance_turnover": {
+                    "block1_pct": round(last_turnover_b1 * 100, 2) if last_turnover_b1 is not None else None,
+                    "block2_pct": round(last_turnover_b2 * 100, 2) if last_turnover_b2 is not None else None,
+                    "combined_pct": round(last_turnover_combined * 100, 2) if last_turnover_combined is not None else None,
+                },
+            }
+            with open(EXP_OUT / "current_holdings.json", "w") as f:
+                json.dump(holdings_data, f, indent=2)
+            print(f"  Saved: current_holdings.json ({len(holdings_list)} positions)")
 
     # STEP 6 — Save
     pd.DataFrame({"date": true_b1.index, "block1": true_b1.values}).to_csv(EXP_OUT / "true_daily_block1.csv", index=False)

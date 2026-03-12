@@ -119,6 +119,20 @@ Set `FRED_API_KEY` in a `.env` file at the project root.
 
 ---
 
+## Dashboard
+
+```bash
+streamlit run dashboard/app.py
+```
+
+**같은 네트워크에서 접속:** `address = "0.0.0.0"` 설정으로 실행 시 터미널에 `Network URL: http://<내부IP>:8501` 이 표시됩니다. 같은 Wi‑Fi/랜에 연결된 휴대폰·다른 PC에서 이 주소로 접속 가능합니다.
+
+**인터넷에서 접속 (외부 공유):**
+- **ngrok:** `ngrok http 8501` 실행 후 생성되는 `https://xxxx.ngrok.io` 주소 사용
+- **Streamlit Community Cloud:** GitHub에 푸시 후 [share.streamlit.io](https://share.streamlit.io)에서 앱 연결 → `https://<앱이름>.streamlit.app` 형태의 공개 URL 발급
+
+---
+
 ## Self-Verification
 
 ```bash
